@@ -9,6 +9,18 @@
 #include <sys/mount.h>
 
 
+// Stack size for the child proccess that will be made by clone() 
+static const int CHILD_STACK_SIZE = 1024 * 1024; 
+
+//Namespaces flags for isolating different resources
+static const int NAMESPACE_FLAGS = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
+
+
+struct ChildArgs{
+  const char* program;
+  char* const* exec_args;
+};
+
 void print_usage(const char* program_name) {
     std::cerr << "Usage:\n"
               << "  " << program_name << " create\n"
