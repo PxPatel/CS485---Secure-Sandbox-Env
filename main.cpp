@@ -7,12 +7,14 @@
 #include <sys/stat.h>
 #include <fstream>
 #include <sys/mount.h>
+#include <sched.h>
 
 
 // Stack size for the child proccess that will be made by clone() 
 static const int CHILD_STACK_SIZE = 1024 * 1024; 
 
-//Namespaces flags for isolating different resources
+// Namespace flags for full isolation (future work).
+// Currently only CLONE_NEWPID is active in clone() call in cmd_launch.
 static const int NAMESPACE_FLAGS = CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET;
 
 
@@ -75,6 +77,39 @@ int setup_chroot() {
     return 0;
 }
 
+// child_fn: entry point for the cloned child process.
+// clone() requires this exact signature: int fn(void* arg).
+// Must return int (do not call exit). Returning non-zero means child exits with that code.
+static int child_fn(void* arg) {
+    // Unpack arguments passed from parent via clone()'s void* arg parameter.
+    ChildArgs* child_args = static_cast<ChildArgs*>(arg);
+
+    // Step 1: Establish the chroot jail.
+    // setup_chroot() chdirs into ./rootfs, calls chroot("."), then chdirs to /.
+    // After this returns, our filesystem root is rootfs/.
+    if (setup_chroot() != 0) {
+        std::cerr << "child_fn: setup_chroot failed\n";
+        return 1;
+    }
+
+    // Step 2: Mount a fresh procfs at /proc inside the chroot.
+    // CLONE_NEWPID gives this child its own PID namespace (it appears as PID 1
+    // inside the namespace), but /proc is inherited from the parent namespace.
+    // Without mounting a fresh procfs, tools like ps, pgrep, or anything reading
+    // /proc/self will see the host's processes or get empty data. By mounting
+    // AFTER setup_chroot(), this /proc resolves to rootfs/proc on the host,
+    // so the mount does not affect the host's /proc.
+    if (mount("proc", "/proc", "proc", 0, nullptr) != 0) {
+        perror("child_fn: mount /proc");
+        return 1;
+    }
+
+    // Step 3: Execute the sandboxed program.
+    // execvp replaces this process image entirely. If it returns, it failed.
+    execvp(child_args->program, child_args->exec_args);
+    perror("child_fn: execvp");
+    return 1;
+}
 
 int cmd_create() {
     bool needs_creation = false;
@@ -233,39 +268,30 @@ int cmd_launch(int argc, char* argv[]) {
 
     std::cout << "Launching: " << program << std::endl;
 
-    // TODO: This is where namespace creation and sandbox setup will happen
-    // For now, placeholder implementation
-    pid_t pid = fork();
-    
+    // Allocate stack for the child process.
+    // clone() requires an explicit stack. On x86-64, stacks grow downward,
+    // so we pass stack_top (the high end of the allocated buffer) to clone().
+    char* child_stack = new char[CHILD_STACK_SIZE];
+    char* stack_top = child_stack + CHILD_STACK_SIZE;
+
+    // Package arguments for child_fn (passed via clone()'s void* arg parameter).
+    ChildArgs child_args;
+    child_args.program = exec_args[0];        // in-container path (e.g., /tmp/foo)
+    child_args.exec_args = exec_args;         // full argv array, NULL-terminated
+
+    // Clone into a new PID namespace.
+    // Flags breakdown:
+    //   CLONE_NEWPID - child gets its own PID namespace; appears as PID 1 inside it.
+    //   SIGCHLD      - required so waitpid() in parent receives child exit notification.
+    //                  Without this, waitpid() blocks forever or returns ECHILD.
+    pid_t pid = clone(child_fn, stack_top, CLONE_NEWPID | SIGCHLD, &child_args);
+
     if (pid < 0) {
-        perror("fork");
+        perror("clone");
+        delete[] child_stack;
         delete[] exec_args;
         return 1;
     }
-    
-    if (pid == 0) {
-        // Child process - will become the sandboxed program
-        
-        // Setup chroot (must happen before exec)
-        if (setup_chroot() != 0) {
-            std::cerr << "Failed to setup chroot\n";
-            exit(1);
-        }
-
-        // TODO: Create namespaces with clone() instead of fork()
-        // TODO: Mount /proc, /sys, /dev
-        // TODO: Drop privileges if needed
-        
-        // For now, just exec the program (no isolation yet)
-        execvp(exec_args[0], exec_args);
-        
-        // If exec fails
-        perror("exec");
-        exit(1);
-    }
-        
-    // Parent process
-    delete[] exec_args;
 
     std::cout << "Sandbox launched with PID: " << pid << std::endl;
 
@@ -279,7 +305,10 @@ int cmd_launch(int argc, char* argv[]) {
     // Wait for child to complete
     int status;
     waitpid(pid, &status, 0);
-    
+
+    // Free allocations now that child has exited.
+    delete[] child_stack;
+    delete[] exec_args;
 
     std::cout << "-----------------------------------------" << std::endl; //Empty line
     if (WIFEXITED(status)) {
@@ -287,7 +316,6 @@ int cmd_launch(int argc, char* argv[]) {
     } else if (WIFSIGNALED(status)) {
         std::cout << "Sandbox terminated by signal: " << WTERMSIG(status) << std::endl;
     }
-    
 
     // Cleanup: Remove the copied program from rootfs/tmp
     std::cout << "Cleaning up...\n";
