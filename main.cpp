@@ -41,17 +41,6 @@ bool create_dir(const char* path) {
     return mkdir(path, 0755) == 0;
 }
 
-// Helper to copy file
-bool copy_file(const char* src, const char* dst) {
-    std::ifstream source(src, std::ios::binary);
-    std::ofstream dest(dst, std::ios::binary);
-    
-    if (!source || !dest) return false;
-    
-    dest << source.rdbuf();
-    return true;
-}
-
 // Add this helper function before cmd_launch
 int setup_chroot() {
     // Change to rootfs directory
@@ -84,6 +73,12 @@ static int child_fn(void* arg) {
     // Unpack arguments passed from parent via clone()'s void* arg parameter.
     ChildArgs* child_args = static_cast<ChildArgs*>(arg);
 
+
+    if (mount("none", "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0) {
+        perror("child_fn: MS_PRIVATE");
+        return 1;
+    }
+
     // Step 1: Establish the chroot jail.
     // setup_chroot() chdirs into ./rootfs, calls chroot("."), then chdirs to /.
     // After this returns, our filesystem root is rootfs/.
@@ -92,22 +87,36 @@ static int child_fn(void* arg) {
         return 1;
     }
 
-    // Step 2: Mount a fresh procfs at /proc inside the chroot.
-    // CLONE_NEWPID gives this child its own PID namespace (it appears as PID 1
-    // inside the namespace), but /proc is inherited from the parent namespace.
-    // Without mounting a fresh procfs, tools like ps, pgrep, or anything reading
-    // /proc/self will see the host's processes or get empty data. By mounting
-    // AFTER setup_chroot(), this /proc resolves to rootfs/proc on the host,
-    // so the mount does not affect the host's /proc.
     if (mount("proc", "/proc", "proc", 0, nullptr) != 0) {
         perror("child_fn: mount /proc");
         return 1;
     }
 
+    if (mount("sysfs", "/sys", "sysfs", 0, nullptr) != 0) {
+        perror("child_fn: mount /sys");
+        // Non-fatal, continue
+    }
+
+    if (mount("tmpfs", "/dev", "tmpfs", MS_NOSUID, "mode=755") != 0) {
+        perror("child_fn: mount /dev");
+        return 1;
+    }
+
+    // Minimal required device nodes
+    // if (system("mknod -m 666 /dev/null    c 1 3") != 0) perror("mknod /dev/null");
+    // if (system("mknod -m 666 /dev/zero    c 1 5") != 0) perror("mknod /dev/zero");
+    // if (system("mknod -m 666 /dev/random  c 1 8") != 0) perror("mknod /dev/random");
+    // if (system("mknod -m 666 /dev/urandom c 1 9") != 0) perror("mknod /dev/urandom");
+    // if (system("mknod -m 620 /dev/tty     c 5 0") != 0) perror("mknod /dev/tty");
+
     // Step 3: Execute the sandboxed program.
     // execvp replaces this process image entirely. If it returns, it failed.
     execvp(child_args->program, child_args->exec_args);
     perror("child_fn: execvp");
+
+    umount("/proc"); // Cleanup proc mount before exiting
+    umount("/sys");
+    umount("/dev");
     return 1;
 }
 
@@ -118,7 +127,11 @@ int cmd_create() {
         std::cout << "rootfs already exists. Validating...\n";
         
         // Check essential directories
-        const char* required_dirs[] = {"./rootfs/bin", "./rootfs/lib", "./rootfs/proc"};
+        const char* required_dirs[] = {
+            "./rootfs/bin", "./rootfs/lib", "./rootfs/proc",
+            "./rootfs/sys", "./rootfs/dev", "./rootfs/etc",
+            "./rootfs/tmp", "./rootfs/usr", "./rootfs/usr/bin"
+        };
         bool all_valid = true;
         
         for (const char* dir : required_dirs) {
@@ -164,52 +177,86 @@ int cmd_create() {
     
     // Create directory structure
     const char* dirs[] = {
-        "./rootfs",
-        "./rootfs/bin",
-        "./rootfs/lib",
-        "./rootfs/lib64",
-        "./rootfs/proc",
-        "./rootfs/sys",
-        "./rootfs/dev",
-        "./rootfs/etc",
-        "./rootfs/tmp"
+        "./rootfs",          "./rootfs/bin",
+        "./rootfs/lib",      "./rootfs/lib64",
+        "./rootfs/lib/x86_64-linux-gnu",
+        "./rootfs/usr",      "./rootfs/usr/bin",
+        "./rootfs/proc",     "./rootfs/sys",
+        "./rootfs/dev",      "./rootfs/etc",
+        "./rootfs/tmp",
+        nullptr
     };
-    
-    for (const char* dir : dirs) {
-        if (!create_dir(dir) && errno != EEXIST) {
-            perror(dir);
+
+    for (int i = 0; dirs[i]; i++) {
+        if (!create_dir(dirs[i]) && errno != EEXIST) {
+            perror(dirs[i]);
             return 1;
         }
     }
     
+    system("chmod 1777 ./rootfs/tmp");
+
     std::cout << "Copying essential binaries...\n";
     
     // Use system() to leverage bash for complex operations
     // Copy bash and its dependencies
-    int ret = system("cp /bin/bash ./rootfs/bin/ 2>/dev/null");
-    if (ret != 0) {
-        std::cerr << "Warning: Failed to copy /bin/bash\n";
+    const char* binaries[] = {
+        "bash", "sh", "ls", "cat", "cp", "mv", "rm",
+        "mkdir", "rmdir", "touch", "ln", "chmod", "stat",
+        "find", "grep", "ps", "sleep", "env", "realpath",
+        nullptr
+    };
+    const char* search_paths[] = { "/bin/", "/usr/bin/", nullptr };
+
+    for (int i = 0; binaries[i]; i++) {
+        bool found = false;
+        for (int j = 0; search_paths[j]; j++) {
+            std::string full_path = std::string(search_paths[j]) + binaries[i];
+            if (access(full_path.c_str(), F_OK) == 0) {
+                system(("cp " + full_path + " ./rootfs/bin/ 2>/dev/null").c_str());
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            std::cerr << "Warning: binary not found on host: " << binaries[i] << "\n";
+        }
     }
     
-    // Copy basic utilities
-    system("cp /bin/ls ./rootfs/bin/ 2>/dev/null");
-    system("cp /bin/cat ./rootfs/bin/ 2>/dev/null");
-    system("cp /bin/sh ./rootfs/bin/ 2>/dev/null");
-    
     std::cout << "Copying shared libraries...\n";
-    
     // Copy common libraries (this is a simplified approach)
     system("cp /lib64/ld-linux-x86-64.so.2 ./rootfs/lib64/ 2>/dev/null");
     system("mkdir -p ./rootfs/lib/x86_64-linux-gnu");
     system("cp /lib/x86_64-linux-gnu/*.so* ./rootfs/lib/x86_64-linux-gnu/ 2>/dev/null");
     
+
+    // Essential etc files
+    std::cout << "Copying /etc files...\n";
+    const char* etc_files[] = {
+        "/etc/os-release", "/etc/hostname",    "/etc/hosts",
+        "/etc/resolv.conf", "/etc/nsswitch.conf",
+        "/etc/passwd",     "/etc/group",
+        "/etc/ld.so.conf",
+        nullptr
+    };
+    for (int i = 0; etc_files[i]; i++) {
+        system(("cp " + std::string(etc_files[i]) + " ./rootfs/etc/ 2>/dev/null").c_str());
+    }
+    system("cp -r /etc/ld.so.conf.d ./rootfs/etc/ 2>/dev/null");
+
     std::cout << "rootfs created successfully!\n";
+
     std::cout << "Note: This is a basic setup. Add more binaries as needed.\n";
-    
     return 0;
 }
 
 int cmd_launch(int argc, char* argv[]) {
+
+    if (geteuid() != 0) {
+        std::cerr << "Error: 'launch' requires root privileges (run with sudo)\n";
+        return 1;
+    }
+
     if (argc < 3) {
         std::cerr << "Error: No program specified\n";
         std::cerr << "Usage: launch <program> [args...]\n";
@@ -223,20 +270,16 @@ int cmd_launch(int argc, char* argv[]) {
         std::cerr << "Error: Program not found: " << program << std::endl;
         return 1;
     }
-    
-    // Determine the target path in rootfs
-    std::string target_path = "./rootfs";
+        
+    system("rm -rf ./rootfs/tmp/* 2>/dev/null");
+    system("find ./rootfs/tmp -mindepth 1 -delete 2>/dev/null");
+
     std::string program_name;
-    
-    // Extract just the filename from the path
     const char* last_slash = strrchr(program, '/');
-    if (last_slash) {
-        program_name = last_slash + 1;
-    } else {
-        program_name = program;
-    }
-    
-    target_path += "/tmp/" + program_name;
+    program_name = last_slash ? last_slash + 1 : program;
+
+    std::string target_path = "./rootfs/tmp/" + program_name;
+
     
     // Copy program into rootfs/tmp
     std::string copy_cmd = "cp ";
@@ -250,9 +293,7 @@ int cmd_launch(int argc, char* argv[]) {
     }
     
     // Make it executable
-    std::string chmod_cmd = "chmod +x " + target_path;
-    system(chmod_cmd.c_str());
-    
+    system(("chmod +x " + target_path).c_str());
     std::cout << "Copied " << program << " to container\n";
     
     // The path inside the container will be /tmp/<filename>
@@ -260,6 +301,7 @@ int cmd_launch(int argc, char* argv[]) {
 
     // Prepare arguments for exec (program name + user args + NULL)
     char** exec_args = new char*[argc - 1];  // -1 because we skip "launch"
+    exec_args[argc - 2] = nullptr;           // exec_args[1] = nullptr
     exec_args[0] = strdup(container_path.c_str());
     for (int i = 3; i < argc; i++) {
         exec_args[i - 2] = argv[i];
@@ -284,10 +326,11 @@ int cmd_launch(int argc, char* argv[]) {
     //   CLONE_NEWPID - child gets its own PID namespace; appears as PID 1 inside it.
     //   SIGCHLD      - required so waitpid() in parent receives child exit notification.
     //                  Without this, waitpid() blocks forever or returns ECHILD.
-    pid_t pid = clone(child_fn, stack_top, CLONE_NEWPID | SIGCHLD, &child_args);
+    pid_t pid = clone(child_fn, stack_top, CLONE_NEWPID | CLONE_NEWNS | SIGCHLD, &child_args);
 
     if (pid < 0) {
         perror("clone");
+        free(exec_args[0]);
         delete[] child_stack;
         delete[] exec_args;
         return 1;
@@ -306,21 +349,26 @@ int cmd_launch(int argc, char* argv[]) {
     int status;
     waitpid(pid, &status, 0);
 
-    // Free allocations now that child has exited.
+    // Safety net umount in case CLONE_NEWNS didn't fully isolate on this kernel.
+    // On a properly isolated namespace this is a no-op.
+    system("umount ./rootfs/proc 2>/dev/null");
+    system("umount ./rootfs/sys  2>/dev/null");
+    system("umount ./rootfs/dev  2>/dev/null");
+
+    // Wipe /tmp after the run — prevents state from leaking into the next launch.
+    system("rm -rf ./rootfs/tmp/* 2>/dev/null");
+    system("rm -rf ./rootfs/tmp/.* 2>/dev/null");
+
+    free(exec_args[0]);
     delete[] child_stack;
     delete[] exec_args;
 
-    std::cout << "-----------------------------------------" << std::endl; //Empty line
+    std::cout << "-----------------------------------------" << std::endl;
     if (WIFEXITED(status)) {
         std::cout << "Sandbox exited with status: " << WEXITSTATUS(status) << std::endl;
     } else if (WIFSIGNALED(status)) {
         std::cout << "Sandbox terminated by signal: " << WTERMSIG(status) << std::endl;
     }
-
-    // Cleanup: Remove the copied program from rootfs/tmp
-    std::cout << "Cleaning up...\n";
-    std::string cleanup_cmd = "rm -f " + target_path;
-    system(cleanup_cmd.c_str());
 
     return 0;
 }
