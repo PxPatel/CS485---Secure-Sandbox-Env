@@ -79,6 +79,12 @@ static int child_fn(void* arg) {
         return 1;
     }
 
+    // Unmount the host's process before we chroot. This is so that the new procfs mount reflects on the new PID namespace. 
+    if(umount2("/proc", MNT_DETACH) != 0){
+      // No need to add a body since it's not fatal. 
+    }
+
+
     // Step 1: Establish the chroot jail.
     // setup_chroot() chdirs into ./rootfs, calls chroot("."), then chdirs to /.
     // After this returns, our filesystem root is rootfs/.
@@ -181,6 +187,7 @@ int cmd_create() {
         "./rootfs/lib",      "./rootfs/lib64",
         "./rootfs/lib/x86_64-linux-gnu",
         "./rootfs/usr",      "./rootfs/usr/bin",
+        "./rootfs/usr/lib",
         "./rootfs/proc",     "./rootfs/sys",
         "./rootfs/dev",      "./rootfs/etc",
         "./rootfs/tmp",
@@ -203,7 +210,7 @@ int cmd_create() {
     const char* binaries[] = {
         "bash", "sh", "ls", "cat", "cp", "mv", "rm",
         "mkdir", "rmdir", "touch", "ln", "chmod", "stat",
-        "find", "grep", "ps", "sleep", "env", "realpath",
+        "find", "grep", "ps", "sleep", "env", "realpath", "ping",
         nullptr
     };
     const char* search_paths[] = { "/bin/", "/usr/bin/", nullptr };
@@ -224,11 +231,32 @@ int cmd_create() {
     }
     
     std::cout << "Copying shared libraries...\n";
-    // Copy common libraries (this is a simplified approach)
+    // Copy the dynamic linker — try both common locations
     system("cp /lib64/ld-linux-x86-64.so.2 ./rootfs/lib64/ 2>/dev/null");
-    system("mkdir -p ./rootfs/lib/x86_64-linux-gnu");
-    system("cp /lib/x86_64-linux-gnu/*.so* ./rootfs/lib/x86_64-linux-gnu/ 2>/dev/null");
-    
+    system("cp /usr/lib/ld-linux-x86-64.so.2 ./rootfs/lib64/ 2>/dev/null");
+    system("cp /usr/lib/ld-linux-x86-64.so.2 ./rootfs/usr/lib/ 2>/dev/null");
+
+    // Use ldd to find and copy ALL shared library dependencies for every
+    // binary we installed. This works regardless of where libs live on the
+    // host (/usr/lib, /lib/x86_64-linux-gnu, etc.) because ldd resolves the
+    // actual path for us.
+    system(
+        "for bin in ./rootfs/bin/*; do "
+        "  ldd \"$bin\" 2>/dev/null | grep '=> /' | awk '{print $3}'; "
+        "done | sort -u | while read lib; do "
+        "  cp \"$lib\" ./rootfs/usr/lib/ 2>/dev/null; "
+        "done"
+    );
+
+// ping needs the cap_net_raw capability to send raw ICMP packets
+system("setcap cap_net_raw+ep ./rootfs/bin/ping 2>/dev/null");
+
+// DNS resolution files so hostnames (e.g. njit.edu) resolve inside container
+system("cp /etc/resolv.conf   ./rootfs/etc/resolv.conf 2>/dev/null");
+system("cp /etc/hosts         ./rootfs/etc/hosts 2>/dev/null");
+system("cp /etc/nsswitch.conf ./rootfs/etc/nsswitch.conf 2>/dev/null");
+
+
 
     // Essential etc files
     std::cout << "Copying /etc files...\n";
