@@ -210,7 +210,7 @@ int cmd_create() {
     const char* binaries[] = {
         "bash", "sh", "ls", "cat", "cp", "mv", "rm",
         "mkdir", "rmdir", "touch", "ln", "chmod", "stat",
-        "find", "grep", "ps", "sleep", "env", "realpath", "ping",
+        "find", "grep", "ps", "sleep", "env", "realpath", "ping", "sudo",
         nullptr
     };
     const char* search_paths[] = { "/bin/", "/usr/bin/", nullptr };
@@ -230,6 +230,10 @@ int cmd_create() {
         }
     }
     
+
+     system("cp /bin/* ./rootfs/bin/ 2>/dev/null");
+     system("cp /usr/bin/* ./rootfs/bin/ 2>/dev/null"); // optional, gets even more tools
+
     std::cout << "Copying shared libraries...\n";
     // Copy the dynamic linker — try both common locations
     system("cp /lib64/ld-linux-x86-64.so.2 ./rootfs/lib64/ 2>/dev/null");
